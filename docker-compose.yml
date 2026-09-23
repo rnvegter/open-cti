@@ -1,0 +1,361 @@
+# OpenCTI stack for Docker on Linux.
+# Based on https://github.com/OpenCTI-Platform/docker (OpenCTI-only, without XTM One).
+# Configure through .env (run ./setup.sh to generate it).
+
+name: ${COMPOSE_PROJECT_NAME:-opencti}
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "50m"
+    max-file: "5"
+
+x-connector-env: &connector-env
+  OPENCTI_URL: http://opencti:8080
+  OPENCTI_TOKEN: ${OPENCTI_ADMIN_TOKEN}
+
+x-connector: &connector
+  restart: always
+  logging: *logging
+  depends_on:
+    opencti:
+      condition: service_healthy
+
+services:
+
+  ###########################
+  # DEPENDENCIES            #
+  ###########################
+
+  redis:
+    image: redis:8.10.1
+    restart: always
+    logging: *logging
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.19.21
+    restart: always
+    logging: *logging
+    volumes:
+      - esdata:/usr/share/elasticsearch/data
+    environment:
+      - discovery.type=single-node
+      - xpack.ml.enabled=false
+      - xpack.security.enabled=false
+      - thread_pool.search.queue_size=5000
+      - logger.org.elasticsearch.discovery=ERROR
+      - "ES_JAVA_OPTS=-Xms${ELASTIC_MEMORY_SIZE:-4G} -Xmx${ELASTIC_MEMORY_SIZE:-4G}"
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 65536
+        hard: 65536
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s http://localhost:9200/_cluster/health?wait_for_status=yellow >/dev/null || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 50
+
+  # S3-compatible object storage (MinIO-compatible fork used by upstream).
+  minio:
+    image: pgsty/silo:latest
+    restart: always
+    logging: *logging
+    command: server /data
+    volumes:
+      - s3data:/data
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  rabbitmq:
+    image: rabbitmq:4.3-management
+    restart: always
+    logging: *logging
+    environment:
+      - RABBITMQ_DEFAULT_USER=${RABBITMQ_DEFAULT_USER}
+      - RABBITMQ_DEFAULT_PASS=${RABBITMQ_DEFAULT_PASS}
+      - RABBITMQ_NODENAME=rabbit01@localhost
+    volumes:
+      - ./rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf:ro
+      - amqpdata:/var/lib/rabbitmq
+    healthcheck:
+      test: rabbitmq-diagnostics -q ping
+      interval: 30s
+      timeout: 30s
+      retries: 3
+
+  ###########################
+  # OPENCTI                 #
+  ###########################
+
+  opencti:
+    image: opencti/platform:${OPENCTI_VERSION}
+    restart: always
+    logging: *logging
+    environment:
+      - NODE_OPTIONS=--max-old-space-size=${OPENCTI_NODE_MEMORY_MB:-8096}
+      - APP__PORT=8080
+      - APP__BASE_URL=https://${OPENCTI_HOST}
+      - APP__ADMIN__EMAIL=${OPENCTI_ADMIN_EMAIL}
+      - APP__ADMIN__PASSWORD=${OPENCTI_ADMIN_PASSWORD}
+      - APP__ADMIN__TOKEN=${OPENCTI_ADMIN_TOKEN}
+      - APP__ENCRYPTION_KEY=${OPENCTI_ENCRYPTION_KEY}
+      - APP__HEALTH_ACCESS_KEY=${OPENCTI_HEALTHCHECK_ACCESS_KEY}
+      - REDIS__HOSTNAME=redis
+      - REDIS__PORT=6379
+      - ELASTICSEARCH__URL=http://elasticsearch:9200
+      - ELASTICSEARCH__NUMBER_OF_REPLICAS=0
+      - MINIO__ENDPOINT=minio
+      - MINIO__PORT=9000
+      - MINIO__USE_SSL=false
+      - MINIO__ACCESS_KEY=${MINIO_ROOT_USER}
+      - MINIO__SECRET_KEY=${MINIO_ROOT_PASSWORD}
+      - RABBITMQ__HOSTNAME=rabbitmq
+      - RABBITMQ__PORT=5672
+      - RABBITMQ__PORT_MANAGEMENT=15672
+      - RABBITMQ__MANAGEMENT_SSL=false
+      - RABBITMQ__USERNAME=${RABBITMQ_DEFAULT_USER}
+      - RABBITMQ__PASSWORD=${RABBITMQ_DEFAULT_PASS}
+      - SMTP__HOSTNAME=${SMTP_HOSTNAME:-localhost}
+      - SMTP__PORT=${SMTP_PORT:-25}
+      - PROVIDERS__LOCAL__STRATEGY=LocalStrategy
+    # Direct HTTP access for local debugging only; users go through Caddy (HTTPS).
+    ports:
+      - "${OPENCTI_BIND_ADDRESS:-127.0.0.1}:${OPENCTI_HOST_PORT:-8080}:8080"
+    depends_on:
+      redis:
+        condition: service_healthy
+      elasticsearch:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/health?health_access_key=${OPENCTI_HEALTHCHECK_ACCESS_KEY}"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      # First boot initialises the schema and can take several minutes.
+      start_period: 180s
+
+  # HTTPS reverse proxy with automatic certificates (see Caddyfile).
+  caddy:
+    image: caddy:2.11.4
+    restart: always
+    logging: *logging
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    environment:
+      OPENCTI_HOST: ${OPENCTI_HOST}
+      CADDY_TLS: ${CADDY_TLS}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddydata:/data
+      - caddyconfig:/config
+    depends_on:
+      - opencti
+
+  worker:
+    image: opencti/worker:${OPENCTI_VERSION}
+    restart: always
+    logging: *logging
+    environment:
+      - OPENCTI_URL=http://opencti:8080
+      - OPENCTI_TOKEN=${OPENCTI_ADMIN_TOKEN}
+    depends_on:
+      opencti:
+        condition: service_healthy
+    deploy:
+      mode: replicated
+      replicas: ${OPENCTI_WORKER_REPLICAS:-3}
+
+  ###########################
+  # INTERNAL CONNECTORS     #
+  ###########################
+
+  connector-export-file-stix:
+    <<: *connector
+    image: opencti/connector-export-file-stix:${OPENCTI_VERSION}
+    environment:
+      <<: *connector-env
+      CONNECTOR_ID: ${CONNECTOR_EXPORT_FILE_STIX_ID}
+      CONNECTOR_TYPE: INTERNAL_EXPORT_FILE
+      CONNECTOR_NAME: ExportFileStix2
+      CONNECTOR_SCOPE: application/json
+
+  connector-export-file-csv:
+    <<: *connector
+    image: opencti/connector-export-file-csv:${OPENCTI_VERSION}
+    environment:
+      <<: *connector-env
+      CONNECTOR_ID: ${CONNECTOR_EXPORT_FILE_CSV_ID}
+      CONNECTOR_TYPE: INTERNAL_EXPORT_FILE
+      CONNECTOR_NAME: ExportFileCsv
+      CONNECTOR_SCOPE: text/csv
+
+  connector-export-file-txt:
+    <<: *connector
+    image: opencti/connector-export-file-txt:${OPENCTI_VERSION}
+    environment:
+      <<: *connector-env
+      CONNECTOR_ID: ${CONNECTOR_EXPORT_FILE_TXT_ID}
+      CONNECTOR_TYPE: INTERNAL_EXPORT_FILE
+      CONNECTOR_NAME: ExportFileTxt
+      CONNECTOR_SCOPE: text/plain
+
+  connector-import-file-stix:
+    <<: *connector
+    image: opencti/connector-import-file-stix:${OPENCTI_VERSION}
+    environment:
+      <<: *connector-env
+      CONNECTOR_ID: ${CONNECTOR_IMPORT_FILE_STIX_ID}
+      CONNECTOR_TYPE: INTERNAL_IMPORT_FILE
+      CONNECTOR_NAME: ImportFileStix
+      CONNECTOR_VALIDATE_BEFORE_IMPORT: "true"
+      CONNECTOR_SCOPE: application/json,text/xml
+      CONNECTOR_AUTO: "true"
+
+  connector-import-document:
+    <<: *connector
+    image: opencti/connector-import-document:${OPENCTI_VERSION}
+    environment:
+      <<: *connector-env
+      CONNECTOR_ID: ${CONNECTOR_IMPORT_DOCUMENT_ID}
+      CONNECTOR_TYPE: INTERNAL_IMPORT_FILE
+      CONNECTOR_NAME: ImportDocument
+      CONNECTOR_VALIDATE_BEFORE_IMPORT: "true"
+      CONNECTOR_SCOPE: application/pdf,text/plain,text/html
+      CONNECTOR_AUTO: "true"
+      CONNECTOR_ONLY_CONTEXTUAL: "false"
+      IMPORT_DOCUMENT_CREATE_INDICATOR: "true"
+
+  connector-import-file-yara:
+    <<: *connector
+    image: opencti/connector-import-file-yara:${OPENCTI_VERSION}
+    environment:
+      <<: *connector-env
+      CONNECTOR_ID: ${CONNECTOR_IMPORT_FILE_YARA_ID}
+      CONNECTOR_NAME: ImportFileYARA
+      CONNECTOR_VALIDATE_BEFORE_IMPORT: "true"
+      CONNECTOR_SCOPE: text/yara+plain
+      CONNECTOR_AUTO: "false"
+      YARA_IMPORT_FILE_SPLIT_RULES: "true"
+
+  connector-analysis:
+    <<: *connector
+    image: opencti/connector-import-document:${OPENCTI_VERSION}
+    environment:
+      <<: *connector-env
+      CONNECTOR_ID: ${CONNECTOR_ANALYSIS_ID}
+      CONNECTOR_TYPE: INTERNAL_ANALYSIS
+      CONNECTOR_NAME: ImportDocumentAnalysis
+      CONNECTOR_VALIDATE_BEFORE_IMPORT: "false"
+      CONNECTOR_SCOPE: application/pdf,text/plain,text/html
+      CONNECTOR_AUTO: "true"
+      CONNECTOR_ONLY_CONTEXTUAL: "false"
+
+  connector-import-external-reference:
+    <<: *connector
+    image: opencti/connector-import-external-reference:${OPENCTI_VERSION}
+    environment:
+      <<: *connector-env
+      CONNECTOR_ID: ${CONNECTOR_IMPORT_EXTERNAL_REFERENCE_ID}
+      CONNECTOR_NAME: ImportExternalReference
+
+  ###########################
+  # DEFAULT DATA            #
+  ###########################
+
+  # Marking definitions, sectors, countries/regions.
+  connector-opencti:
+    <<: *connector
+    image: opencti/connector-opencti:${OPENCTI_VERSION}
+    environment:
+      <<: *connector-env
+      CONNECTOR_ID: ${CONNECTOR_OPENCTI_ID}
+      CONNECTOR_NAME: OpenCTI Datasets
+      CONNECTOR_SCOPE: marking-definition,identity,location
+      CONNECTOR_AUTO_CREATE_SERVICE_ACCOUNT: "true"
+      CONNECTOR_AUTO_CREATE_SERVICE_ACCOUNT_CONFIDENCE_LEVEL: "100"
+
+  # MITRE ATT&CK.
+  connector-mitre:
+    <<: *connector
+    image: opencti/connector-mitre:${OPENCTI_VERSION}
+    environment:
+      <<: *connector-env
+      CONNECTOR_ID: ${CONNECTOR_MITRE_ID}
+      CONNECTOR_AUTO_CREATE_SERVICE_ACCOUNT: "true"
+      CONNECTOR_AUTO_CREATE_SERVICE_ACCOUNT_CONFIDENCE_LEVEL: "75"
+
+  ###########################
+  # THREAT FEEDS            #
+  ###########################
+
+  # CISA Known Exploited Vulnerabilities catalog (no API key needed).
+  connector-cisa-kev:
+    <<: *connector
+    image: opencti/connector-cisa-known-exploited-vulnerabilities:${OPENCTI_VERSION}
+    environment:
+      <<: *connector-env
+      CONNECTOR_ID: ${CONNECTOR_CISA_KEV_ID}
+      CONNECTOR_NAME: CISA Known Exploited Vulnerabilities
+      CONNECTOR_SCOPE: cisa
+      CONNECTOR_LOG_LEVEL: error
+      CONNECTOR_DURATION_PERIOD: P2D
+      CISA_TLP: TLP:CLEAR
+
+  # AlienVault OTX pulses. Only starts with the "alienvault" profile, which
+  # setup.sh enables once ALIENVAULT_API_KEY is set in .env.
+  connector-alienvault:
+    <<: *connector
+    image: opencti/connector-alienvault:${OPENCTI_VERSION}
+    profiles: ["alienvault"]
+    environment:
+      <<: *connector-env
+      CONNECTOR_ID: ${CONNECTOR_ALIENVAULT_ID}
+      CONNECTOR_NAME: AlienVault
+      CONNECTOR_SCOPE: alienvault
+      CONNECTOR_LOG_LEVEL: error
+      CONNECTOR_DURATION_PERIOD: PT30M
+      ALIENVAULT_BASE_URL: https://otx.alienvault.com
+      ALIENVAULT_API_KEY: ${ALIENVAULT_API_KEY}
+      ALIENVAULT_TLP: White
+      ALIENVAULT_CREATE_OBSERVABLES: "true"
+      ALIENVAULT_CREATE_INDICATORS: "true"
+      ALIENVAULT_PULSE_START_TIMESTAMP: ${ALIENVAULT_PULSE_START_TIMESTAMP}
+      ALIENVAULT_REPORT_TYPE: threat-report
+      ALIENVAULT_REPORT_STATUS: New
+      ALIENVAULT_GUESS_MALWARE: "false"
+      ALIENVAULT_GUESS_CVE: "false"
+      ALIENVAULT_EXCLUDED_PULSE_INDICATOR_TYPES: FileHash-MD5,FileHash-SHA1
+      ALIENVAULT_ENABLE_RELATIONSHIPS: "true"
+      ALIENVAULT_ENABLE_ATTACK_PATTERNS_INDICATES: "true"
+      ALIENVAULT_FILTER_INDICATORS: "false"
+      ALIENVAULT_DEFAULT_X_OPENCTI_SCORE: "50"
+
+volumes:
+  esdata:
+  s3data:
+  redisdata:
+  amqpdata:
+  caddydata:    # certificates and ACME account; back this up
+  caddyconfig:
