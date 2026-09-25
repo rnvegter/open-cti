@@ -110,7 +110,7 @@ services:
     environment:
       - NODE_OPTIONS=--max-old-space-size=${OPENCTI_NODE_MEMORY_MB:-8096}
       - APP__PORT=8080
-      - APP__BASE_URL=https://${OPENCTI_HOST}
+      - APP__BASE_URL=http://${OPENCTI_HOST}:${OPENCTI_PORT:-8080}
       - APP__ADMIN__EMAIL=${OPENCTI_ADMIN_EMAIL}
       - APP__ADMIN__PASSWORD=${OPENCTI_ADMIN_PASSWORD}
       - APP__ADMIN__TOKEN=${OPENCTI_ADMIN_TOKEN}
@@ -134,9 +134,9 @@ services:
       - SMTP__HOSTNAME=${SMTP_HOSTNAME:-localhost}
       - SMTP__PORT=${SMTP_PORT:-25}
       - PROVIDERS__LOCAL__STRATEGY=LocalStrategy
-    # Direct HTTP access for local debugging only; users go through Caddy (HTTPS).
+    # Web UI and API, plain HTTP on the internal network.
     ports:
-      - "${OPENCTI_BIND_ADDRESS:-127.0.0.1}:${OPENCTI_HOST_PORT:-8080}:8080"
+      - "${OPENCTI_PORT:-8080}:8080"
     depends_on:
       redis:
         condition: service_healthy
@@ -153,25 +153,6 @@ services:
       retries: 20
       # First boot initialises the schema and can take several minutes.
       start_period: 180s
-
-  # HTTPS reverse proxy with automatic certificates (see Caddyfile).
-  caddy:
-    image: caddy:2.11.4
-    restart: always
-    logging: *logging
-    ports:
-      - "80:80"
-      - "443:443"
-      - "443:443/udp"
-    environment:
-      OPENCTI_HOST: ${OPENCTI_HOST}
-      CADDY_TLS: ${CADDY_TLS}
-    volumes:
-      - ./Caddyfile:/etc/caddy/Caddyfile:ro
-      - caddydata:/data
-      - caddyconfig:/config
-    depends_on:
-      - opencti
 
   worker:
     image: opencti/worker:${OPENCTI_VERSION}
@@ -357,5 +338,3 @@ volumes:
   s3data:
   redisdata:
   amqpdata:
-  caddydata:    # certificates and ACME account; back this up
-  caddyconfig:

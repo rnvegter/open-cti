@@ -1,36 +1,31 @@
 #!/usr/bin/env bash
-# Prepare a Linux host for the OpenCTI Docker stack (served over HTTPS by Caddy).
+# Prepare a Linux host for the OpenCTI Docker stack (plain HTTP on an internal network).
 #
-#   ./setup.sh --host <hostname-or-ip> [--email <you@example.org> | --internal-tls] [--start]
+#   ./setup.sh [--host <hostname-or-ip>] [--start]
 #
-#   --host          name (or IP) users type in the browser; OpenCTI runs at https://<host>
-#   --email         get a Let's Encrypt certificate (host must be public DNS, ports 80/443 open)
-#   --internal-tls  use Caddy's own CA instead (default for IPs, localhost and single-label names)
-#   --start         pull images and start the stack
+#   --host   name or IP users type in the browser; OpenCTI runs at http://<host>:8080
+#            (default: this server's first IP address)
+#   --start  pull images and start the stack
 #
-# Checks Docker, Compose, RAM and ports 80/443, sets vm.max_map_count for Elasticsearch,
-# and creates .env with random secrets. An existing .env keeps its secrets; missing keys are
-# added and --host/--email/--internal-tls are applied to it.
+# Checks Docker, Compose, RAM and the OpenCTI port, sets vm.max_map_count for
+# Elasticsearch, and creates .env with random secrets. An existing .env keeps its
+# secrets; missing keys are added and --host is applied to it.
 set -euo pipefail
 
 cd "$(dirname "$0")"
 
 HOST=""
-EMAIL=""
-INTERNAL_TLS=false
 START=false
 MIN_MAP_COUNT=1048575
 MIN_RAM_GB=16
 
-usage() { sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+usage() { sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --host)         HOST="${2:?--host needs a value}"; shift 2 ;;
-    --email)        EMAIL="${2:?--email needs a value}"; shift 2 ;;
-    --internal-tls) INTERNAL_TLS=true; shift ;;
-    --start)        START=true; shift ;;
-    -h|--help)      usage 0 ;;
+    --host)    HOST="${2:?--host needs a value}"; shift 2 ;;
+    --start)   START=true; shift ;;
+    -h|--help) usage 0 ;;
     *) echo "Unknown argument: $1" >&2; usage 1 ;;
   esac
 done
@@ -38,8 +33,6 @@ done
 info() { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33mWARN:\033[0m %s\n' "$*" >&2; }
 die()  { printf '\033[1;31mERROR:\033[0m %s\n' "$*" >&2; exit 1; }
-
-[[ -n "$EMAIL" ]] && $INTERNAL_TLS && die "Use either --email or --internal-tls, not both."
 
 as_root() {
   if [[ $EUID -eq 0 ]]; then "$@"; else sudo "$@"; fi
@@ -65,11 +58,8 @@ set_env() {
   rm -f "$tmp"
 }
 
-# IPs, localhost and names without a dot can't get a public certificate.
-needs_internal_tls() {
-  local h="$1"
-  [[ "$h" == "localhost" || "$h" != *.* || "$h" == *:* || "$h" =~ ^[0-9.]+$ ]]
-}
+# First IPv4 address of this server (Linux), empty if unknown.
+server_ip() { hostname -I 2>/dev/null | awk '{print $1}'; }
 
 port_in_use() {
   command -v ss >/dev/null && ss -Hltn "sport = :$1" 2>/dev/null | grep -q .
@@ -91,13 +81,6 @@ if [[ -r /proc/meminfo ]]; then
   else
     info "RAM: ~${ram_gb} GB"
   fi
-fi
-
-# Ports held by our own Caddy container are fine (re-runs).
-if [[ -z "$(docker compose ps -q caddy 2>/dev/null)" ]]; then
-  for p in 80 443; do
-    port_in_use "$p" && warn "Port $p is already in use on this host; Caddy will fail to start until it is freed."
-  done
 fi
 
 # --- Kernel tuning for Elasticsearch ----------------------------------------
@@ -143,20 +126,23 @@ for key in $(grep -oE '^CONNECTOR_[A-Z_]+_ID' .env); do
   fill "$key" "$(gen_uuid)"
 done
 
-[[ -n "$HOST" ]] && set_env OPENCTI_HOST "$HOST"
-HOST="$(get_env OPENCTI_HOST)"
+# --- Host and port ----------------------------------------------------------
 
-# --- TLS mode ---------------------------------------------------------------
-
-if $INTERNAL_TLS; then
-  set_env CADDY_TLS internal
-elif [[ -n "$EMAIL" ]]; then
-  needs_internal_tls "$HOST" && die "'${HOST}' can't get a Let's Encrypt certificate (IP/localhost/no domain). Use a public DNS name or --internal-tls."
-  set_env CADDY_TLS "$EMAIL"
-elif ! needs_internal_tls "$HOST" && [[ "$(get_env CADDY_TLS)" == "internal" ]]; then
-  warn "'${HOST}' looks like a domain but CADDY_TLS=internal (self-signed). Re-run with --email <you@example.org> for a Let's Encrypt certificate."
+# OpenCTI builds links from this, so it must be what colleagues type, not localhost.
+if [[ -n "$HOST" ]]; then
+  set_env OPENCTI_HOST "$HOST"
+elif [[ "$(get_env OPENCTI_HOST)" == "localhost" && -n "$(server_ip)" ]]; then
+  set_env OPENCTI_HOST "$(server_ip)"
+  info "OPENCTI_HOST set to $(server_ip) (use --host to pick a DNS name instead)"
 fi
-TLS_MODE="$(get_env CADDY_TLS)"
+HOST="$(get_env OPENCTI_HOST)"
+PORT="$(get_env OPENCTI_PORT)"
+[[ "$HOST" == "localhost" ]] && warn "OPENCTI_HOST is localhost; other machines won't be able to use OpenCTI's links. Re-run with --host <name-or-ip>."
+
+# Ports held by our own OpenCTI container are fine (re-runs).
+if [[ -z "$(docker compose ps -q opencti 2>/dev/null)" ]] && port_in_use "$PORT"; then
+  warn "Port ${PORT} is already in use on this host; set OPENCTI_PORT in .env to a free port."
+fi
 
 # --- AlienVault OTX ---------------------------------------------------------
 
@@ -183,9 +169,6 @@ if grep -q '=CHANGEME' .env; then
   die ".env still contains CHANGEME values: $(grep '=CHANGEME' .env | cut -d= -f1 | tr '\n' ' ')"
 fi
 
-[[ "$(get_env OPENCTI_BIND_ADDRESS)" == "127.0.0.1" ]] || \
-  warn "OPENCTI_BIND_ADDRESS is not 127.0.0.1, so plain HTTP on port $(get_env OPENCTI_HOST_PORT) is exposed next to Caddy."
-
 docker compose config --quiet || die "docker compose config failed; check .env"
 
 # --- Start ------------------------------------------------------------------
@@ -200,11 +183,10 @@ fi
 cat <<EOF
 
 OpenCTI is configured.
-  URL:       https://${HOST}
-  TLS:       $([[ "$TLS_MODE" == "internal" ]] && echo "Caddy internal CA (browsers warn until you trust its root, see README)" || echo "Let's Encrypt (contact: ${TLS_MODE})")
+  URL:       http://${HOST}:${PORT}
   Login:     $(get_env OPENCTI_ADMIN_EMAIL)
   Password:  stored in .env (OPENCTI_ADMIN_PASSWORD)
   AlienVault OTX: ${OTX_STATUS}
 
-$($START && echo "Follow startup with: docker compose logs -f opencti caddy" || echo "Start with: docker compose up -d")
+$($START && echo "Follow startup with: docker compose logs -f opencti" || echo "Start with: docker compose up -d")
 EOF
